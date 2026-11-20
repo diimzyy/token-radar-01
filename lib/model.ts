@@ -264,14 +264,6 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
 }
 
-/** The headline sentence's figures: how many watchlist slugs, how many rows, how many live protocols. */
-export interface BoardSummary {
-  watchlist_size: number;
-  board_size: number;
-  early_size: number;
-  live_size: number;
-}
-
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const index = bySlug(snapshot.protocols);
@@ -417,7 +409,8 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
 }
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
-export function liveRows(snapshot: Snapshot): LiveRow[] {  return snapshot.protocols
+export function liveRows(snapshot: Snapshot): LiveRow[] {
+  return snapshot.protocols
     .filter((p) => !isPreToken(p) && p.category !== 'CEX')
     .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd)
     .slice(0, LIVE_ROWS)
