@@ -287,8 +287,16 @@
     var m = DATA.model;
     var cal = DATA.calibration;
     var calText = cal && cal.live_tokens
-      ? 'The size multiple is calibrated on the ' + cal.live_tokens + ' live-token protocols in this snapshot: for each category, the geometric mean of market cap / TVL, shrunk toward the overall benchmark (' + (cal.overall * 100).toFixed(0) + '% of TVL).'
+      ? 'Fitted on the ' + cal.live_tokens + ' live-token protocols in this snapshot: market cap tracks TVL as a power law (mcap = exp(intercept) x TVL^slope, overall slope ' + (cal.overall.slope !== undefined ? cal.overall.slope.toFixed(2) : String(cal.overall)) + '), shrunk toward the overall fit by each category\'s peer count, slope clamped to [0.2, 1.5] so a two-peer category cannot explode.'
       : 'The size multiple is a single constant when the snapshot carries no live-token protocols.';
+    var bt = DATA.backtest;
+    var btText = bt
+      ? 'Held-out test: the ' + bt.in_sample + ' training protocols fit the model, the other ' + bt.held_out + ' are priced unseen. Median error ' + bt.median_abs_pct_error + '% (' + (bt.within_2x / Math.max(1, bt.held_out) * 100).toFixed(0) + '% within 2x, 10th percentile ' + bt.p10 + '%, 90th ' + bt.p90 + '%).'
+      : 'No held-out test.';
+    var acc = DATA.accounting;
+    var accText = acc
+      ? acc.total + ' protocols in the snapshot: ' + acc.ranked + ' pre-token ones ranked, ' + acc.live + ' live-token ones shown with their market caps' + (acc.set_aside > 0 ? ', ' + acc.set_aside + ' set aside (' + Object.keys(acc.reasons).map(function (k) { return acc.reasons[k] + ' ' + k; }).join(', ') + ')' : '') + '.'
+      : '';
     return el('section', { class: 'panel model' },
       el('h2', { text: 'How implied value is computed' }),
       el('p', { class: 'sub', text: 'Every row is scored by one function of the snapshot figures: TVL times its category size benchmark, a growth term from the seven-day change, and a maturity term from its age. No protocol name is special-cased, and no row is hand-picked.' }),
@@ -296,7 +304,8 @@
         'implied = round( tvl_usd x category_multiple x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
       ),
       el('p', { class: 'sub', text: calText }),
-      el('p', { class: 'sub', text: 'TVL, seven-day growth and age come from the snapshot. The early radar is every pre-token protocol below the watchlist floor, by TVL, and live-token protocols are set aside with their market caps shown.' })
+      el('p', { class: 'sub', text: btText }),
+      acc ? el('p', { class: 'sub', text: accText }) : null
     );
   }
 

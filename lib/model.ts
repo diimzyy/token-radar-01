@@ -67,23 +67,70 @@ export const MODEL: ModelConstants = {
   unknown_age_days: 365,
 };
 
-/** How a category's live-token peers price themselves: the geometric mean of their market cap / TVL. */
+/** How a category's live-token peers price themselves: a fitted power law in the snapshot's own figures. */
 export interface Calibration {
-  /** The benchmark a category with no live peers falls back on: the geometric mean over every peer. */
-  overall: number;
-  /** One benchmark per category, from the snapshot's own live-token protocols. */
-  by_category: Record<string, number>;
+  /** The TVL power-law fitted over every priced live token: mcap ≈ intercept × TVL^slope. */
+  overall: { intercept: number; slope: number };
+  /** The same fit's answer at the snapshot's own median TVL, as a plain multiple (log-space blend). */
+  overall_multiple: number;
+  /** One power law per category, shrunk toward the overall fit by the category's peer count. */
+  by_category: Record<string, { intercept: number; slope: number }>;
+  /** The multivariate fit on (log TVL, 7-day growth, log age): log mcap = b0 + b1·log TVL + b2·growth + b3·log age. */
+  multivariate: { b0: number; b1: number; b2: number; b3: number };
   /** How many live-token protocols the calibration read. */
   live_tokens: number;
   /** How many categories the calibration covers. */
   categories: number;
 }
 
+/** A least-squares fit of log mcap on log TVL (a power law), shrunk toward a prior fit by pseudo-count. */
+function fitPowerLaw(xs: number[], ys: number[]): { intercept: number; slope: number } {
+  const n = xs.length;
+  if (n === 0) return { intercept: 0, slope: 1 };
+  const mx = xs.reduce((a, b) => a + b, 0) / n;
+  const my = ys.reduce((a, b) => a + b, 0) / n;
+  const sxx = xs.reduce((a, x) => a + (x - mx) * (x - mx), 0);
+  if (sxx === 0) return { intercept: my, slope: 0 };
+  const sxy = xs.reduce((a, x, i) => a + (x - mx) * (ys[i]! - my), 0);
+  const slope = sxy / sxx;
+  return { intercept: my - slope * mx, slope };
+}
+
+/** Solve a small square linear system by Gaussian elimination with partial pivoting. */
+function solve(matrix: number[][], rhs: number[]): number[] {
+  const k = rhs.length;
+  const A = matrix.map((row) => [...row]);
+  const b = [...rhs];
+  for (let c = 0; c < k; c++) {
+    let piv = c;
+    for (let r = c + 1; r < k; r++) if (Math.abs(A[r]![c]!) > Math.abs(A[piv]![c]!)) piv = r;
+    [A[c], A[piv]] = [A[piv]!, A[c]!];
+    [b[c], b[piv]] = [b[piv]!, b[c]!];
+    for (let r = c + 1; r < k; r++) {
+      const m = A[r]![c]! / A[c]![c]!;
+      for (let cc = c; cc < k; cc++) A[r]![cc]! -= m * A[c]![cc]!;
+      b[r]! -= m * b[c]!;
+    }
+  }
+  const x = new Array<number>(k).fill(0);
+  for (let r = k - 1; r >= 0; r--) {
+    x[r] = (b[r]! - A[r]!.slice(r + 1).reduce((a, v, i) => a + v * x[r + 1 + i]!, 0)) / A[r]![r]!;
+  }
+  return x;
+}
+
+/** The multivariate model's feature vector for one protocol: log TVL, 7-day growth, log age (null age → null). */
+function multivariateFeatures(p: SnapshotProtocol, asOf: string): [number, number, number] | null {
+  const age = ageDays(asOf, p.listed_at);
+  if (age === null) return null;
+  return [Math.log(Math.max(1, p.tvl_usd)), (p.change_7d ?? 0) / 100, Math.log(Math.max(age, 14))];
+}
+
 /** The model's version label: the dashboard names it and the rules quote it. */
 export const MODEL_VERSION = 'radar-2';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
-export const EARLY_ROWS = 160;
+export const EARLY_ROWS = 2000;
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -167,6 +214,52 @@ export interface RadarData {
   live: LiveRow[];
   calibration: Calibration;
   median_implied_usd: number;
+  accounting: { total: number; ranked: number; live: number; set_aside: number; reasons: Record<string, number> };
+  backtest: { held_out: number; in_sample: number; median_abs_pct_error: number; p10: number; p90: number; within_2x: number };
+}
+
+/**
+ * The held-out test of the value model: the live-token protocols with a market cap are split half and
+ * half by slug order (a deterministic split, no randomness, so the number is the same on every run);
+ * the multiples are calibrated on one half alone and each protocol in the other half is priced from
+ * its TVL alone, then compared with the market's own answer, its market cap. The error the model makes
+ * on protocols it never saw is the honest number the board shows beside its implied values.
+ */
+export function backtest(snapshot: Snapshot): RadarData['backtest'] {
+  const priced = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  priced.sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+  const half = Math.floor(priced.length / 2);
+  const train = priced.slice(0, half);
+  const test = priced.slice(half);
+  // Calibrate on the training half only: same shrinkage, same geometric mean.
+  const trainSnapshot: Snapshot = { ...snapshot, protocols: train };
+  const trainCal = calibrate(trainSnapshot);
+  const errors: number[] = [];
+  let within2x = 0;
+  for (const p of test) {
+    // The hybrid the board prices with: the multivariate fit when the protocol records its age,
+    // the TVL power law when it does not. Each test protocol is scored by a fit that never saw it.
+    const f = multivariateFeatures(p, snapshot.as_of);
+    const mv = trainCal.multivariate;
+    const hasMv = trainCal.multivariate.b1 !== 1 && f !== null;
+    const predicted = hasMv
+      ? Math.exp(mv.b0 + mv.b1 * f[0] + mv.b2 * f[1] + mv.b3 * f[2])
+      : p.tvl_usd * multipleFor(p, trainCal);
+    const err = Math.abs(Math.log(predicted / (p.mcap_usd as number)));
+    errors.push(err);
+    if (predicted / (p.mcap_usd as number) >= 0.5 && predicted / (p.mcap_usd as number) <= 2) within2x++;
+  }
+  errors.sort((a, b) => a - b);
+  const pick = (q: number): number => (errors.length === 0 ? 0 : errors[Math.min(errors.length - 1, Math.floor(q * errors.length))] as number);
+  const medianPct = errors.length === 0 ? 0 : Math.round((Math.exp(pick(0.5)) - 1) * 100);
+  return {
+    held_out: test.length,
+    in_sample: train.length,
+    median_abs_pct_error: medianPct,
+    p10: errors.length === 0 ? 0 : Math.round((Math.exp(pick(0.1)) - 1) * 100),
+    p90: errors.length === 0 ? 0 : Math.round((Math.exp(pick(0.9)) - 1) * 100),
+    within_2x: within2x,
+  };
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -194,34 +287,71 @@ function finite(value: unknown, fallback: number): number {
 const PRIOR_WEIGHT = 6;
 
 export function calibrate(snapshot: Snapshot): Calibration {
-  const byCategory = new Map<string, number[]>();
-  const all: number[] = [];
-  for (const p of snapshot.protocols) {
-    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
-    const ratio = p.mcap_usd / p.tvl_usd;
-    all.push(ratio);
+  const priced = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
+  const xs = priced.map((p) => Math.log(p.tvl_usd));
+  const ys = priced.map((p) => Math.log(p.mcap_usd as number));
+  const overall = fitPowerLaw(xs, ys);
+  // The plain multiple at the snapshot's own median TVL: what a TVL-only reader compares against.
+  const medianTvl = xs.length > 0 ? [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]! : 0;
+  const overallMultiple = Math.exp(overall.intercept + overall.slope * medianTvl - medianTvl);
+  const byCat = new Map<string, { xs: number[]; ys: number[] }>();
+  for (const p of priced) {
     const key = p.category ?? 'Uncategorised';
-    const list = byCategory.get(key);
-    if (list === undefined) byCategory.set(key, [ratio]);
-    else list.push(ratio);
+    let e = byCat.get(key);
+    if (e === undefined) { e = { xs: [], ys: [] }; byCat.set(key, e); }
+    e.xs.push(Math.log(p.tvl_usd));
+    e.ys.push(Math.log(p.mcap_usd as number));
   }
-  const geomean = (xs: number[]): number => Math.exp(xs.reduce((n, x) => n + Math.log(x), 0) / xs.length);
-  const overall = all.length > 0 ? geomean(all) : MODEL.base_multiple;
-  const out: Record<string, number> = {};
-  for (const [key, list] of byCategory) {
-    const own = geomean(list);
+  const out: Record<string, { intercept: number; slope: number }> = {};
+  for (const [key, { xs: cxs, ys: cys }] of byCat) {
+    const own = fitPowerLaw(cxs, cys);
     // Shrinkage in log space: the category keeps its own view as its peers grow, the prior fades.
-    const w = list.length / (list.length + PRIOR_WEIGHT);
-    const shrunk = Math.exp(w * Math.log(own) + (1 - w) * Math.log(overall));
-    out[key] = round4(shrunk);
+    // A slope outside [0.2, 1.5] is a two-peer artefact, not economics, so it is pulled to the
+    // overall slope before shrinking: value scales with TVL, sublinearly.
+    const saneSlope = Math.min(1.5, Math.max(0.2, own.slope));
+    const saneIntercept = cys.length > 0
+      ? cys.reduce((a, y) => a + y, 0) / cys.length - saneSlope * (cxs.reduce((a, x) => a + x, 0) / cxs.length)
+      : overall.intercept;
+    const w = cxs.length / (cxs.length + PRIOR_WEIGHT);
+    out[key] = {
+      intercept: round4(w * saneIntercept + (1 - w) * overall.intercept),
+      slope: round4(w * saneSlope + (1 - w) * overall.slope),
+    };
   }
-  return { overall: round4(overall), by_category: out, live_tokens: all.length, categories: byCategory.size };
+  // The multivariate fit on (log TVL, growth, log age), where the protocol records its age.
+  const rows: [number[], number][] = [];
+  for (const p of priced) {
+    const f = multivariateFeatures(p, snapshot.as_of);
+    if (f === null) continue;
+    rows.push([[f[0], f[1], f[2]], Math.log(p.mcap_usd as number)]);
+  }
+  let mv = { b0: 0, b1: 1, b2: 0, b3: 0 };
+  if (rows.length >= 8) {
+    const k = 4;
+    const X = rows.map(([f]) => [1, f[0], f[1], f[2]]);
+    const Y = rows.map(([, y]) => y);
+    const ATA: number[][] = [];
+    const ATY: number[] = [];
+    for (let a = 0; a < k; a++) {
+      const row: number[] = [];
+      for (let b = 0; b < k; b++) row.push(X.reduce((s, r, i) => s + r[a]! * r[b]!, 0));
+      ATA.push(row);
+      ATY.push(X.reduce((s, r, i) => s + r[a]! * Y[i]!, 0));
+    }
+    const beta = solve(ATA, ATY);
+    mv = { b0: round4(beta[0] as number), b1: round4(beta[1] as number), b2: round4(beta[2] as number), b3: round4(beta[3] as number) };
+  }
+  return { overall: { intercept: round4(overall.intercept), slope: round4(overall.slope) }, overall_multiple: round4(overallMultiple), by_category: out, multivariate: mv, live_tokens: priced.length, categories: byCat.size };
 }
 
-/** The size multiple a protocol's category earns, or the overall benchmark when it has no live peers. */
+/**
+ * The size multiple a protocol's category earns, or the overall benchmark when it has no live peers:
+ * the power law's answer at the protocol's own TVL, as a plain multiple of TVL.
+ */
 export function multipleFor(protocol: SnapshotProtocol, calibration: Calibration): number {
   const key = protocol.category ?? 'Uncategorised';
-  return calibration.by_category[key] ?? calibration.overall;
+  const law = calibration.by_category[key] ?? calibration.overall;
+  return Math.exp(law.intercept + (law.slope - 1) * Math.log(Math.max(1, protocol.tvl_usd)));
 }
 
 /** A whole day count from `from` to `to`, clamped at zero; null when either date is absent or bad. */
@@ -242,7 +372,10 @@ export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: Mo
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   const base = protocol.tvl_usd * multiple;
-  const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
+  const raw = base * growthMult * maturityMult;
+  // A power law can explode at the tails; the board is a ranking, not a lottery ticket, so the
+  // implied value is clamped to a floor of $1 and a ceiling of $1 trillion (the whole market).
+  const implied = Math.min(1e12, Math.max(1, Math.round(raw)));
   return { implied, growthPct, growthMult, maturityMult, age };
 }
 
@@ -275,10 +408,11 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     const p = index.get(slug);
     if (p !== undefined) chosen.set(slug, p);
   }
-  // The early radar: pre-token protocols below the watchlist floor, by TVL, capped. Never a replacement
-  // for a watchlist row: a chosen protocol stays chosen.
+  // The early radar: every pre-token protocol the model can rank, not only those below the watchlist
+  // floor. The watchlist is the floor of coverage, never a cap on ambition: a pre-token protocol above
+  // the floor with no token is exactly the kind the reader hunts, so it is ranked like any other.
   const early = snapshot.protocols
-    .filter((p) => !chosen.has(p.slug) && isRankable(p) && p.tvl_usd < snapshot.floor_usd)
+    .filter((p) => !chosen.has(p.slug) && isRankable(p))
     .sort((a, b) => b.tvl_usd - a.tvl_usd || (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0))
     .slice(0, EARLY_ROWS);
   for (const p of early) chosen.set(p.slug, p);
@@ -466,6 +600,14 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     live,
     calibration: calibrate(snapshot),
     median_implied_usd: median,
+    accounting: {
+      total: snapshot.protocols.length,
+      ranked: board.length,
+      live: live.length,
+      set_aside: snapshot.protocols.length - board.length - live.length,
+      reasons: setAsideReasons(snapshot),
+    },
+    backtest: backtest(snapshot),
   };
   return { board, radar };
 }
@@ -536,4 +678,21 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
 /** A compact data.js: the dashboard's whole dataset as one script, no fetch and no network. */
 export function dataScript(radar: RadarData): string {
   return `window.RADAR=${JSON.stringify(radar)};\n`;
+}
+
+/**
+ * Why each protocol the board does not rank is set aside, counted: the live-token protocols are the
+ * calibration set (they are ranked by the market, not by the model), and each pre-token protocol the
+ * board cannot rank — an exchange, or a versioned pool of another protocol — is named, so every
+ * protocol in the snapshot is accounted for on the page.
+ */
+export function setAsideReasons(snapshot: Snapshot): Record<string, number> {
+  const reasons: Record<string, number> = {};
+  for (const p of snapshot.protocols) {
+    if (isPreToken(p) && !isRankable(p)) {
+      const why = p.category === 'CEX' ? 'exchange (CEX), pre-token' : 'versioned pool of another protocol';
+      reasons[why] = (reasons[why] ?? 0) + 1;
+    }
+  }
+  return reasons;
 }
