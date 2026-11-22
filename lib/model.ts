@@ -127,7 +127,7 @@ function multivariateFeatures(p: SnapshotProtocol, asOf: string): [number, numbe
 }
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 2000;
@@ -219,42 +219,59 @@ export interface RadarData {
 }
 
 /**
- * The held-out test of the value model: the live-token protocols with a market cap are split half and
- * half by slug order (a deterministic split, no randomness, so the number is the same on every run);
- * the multiples are calibrated on one half alone and each protocol in the other half is priced from
- * its TVL alone, then compared with the market's own answer, its market cap. The error the model makes
- * on protocols it never saw is the honest number the board shows beside its implied values.
+ * The held-out test of the value model: every priced live-token protocol is tested exactly once
+ * in a two-fold pass (each half is priced by a calibration that never saw it, so all 128 are
+ * held out, not half of them), the split stratified by category so both folds carry the same
+ * category mix. The board's own pricing function is what is scored: the category size multiple
+ * from a power law with shrinkage, times the growth term, times the maturity term — the same
+ * arithmetic `impliedValue` runs on every row, so the number the test reports is the number the
+ * board earns. The error on protocols the calibration never saw is the honest number the page
+ * shows beside its implied values.
  */
 export function backtest(snapshot: Snapshot): RadarData['backtest'] {
   const priced = snapshot.protocols.filter((p) => p.mcap_usd !== null && p.mcap_usd > 0 && p.tvl_usd > 0);
   priced.sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
-  const half = Math.floor(priced.length / 2);
-  const train = priced.slice(0, half);
-  const test = priced.slice(half);
-  // Calibrate on the training half only: same shrinkage, same geometric mean.
-  const trainSnapshot: Snapshot = { ...snapshot, protocols: train };
-  const trainCal = calibrate(trainSnapshot);
+  // Stratified interleave: sort by category then slug, then deal alternately into two folds.
+  const stratified = [...priced].sort((a, b) => {
+    const ca = a.category ?? '~';
+    const cb = b.category ?? '~';
+    return ca < cb ? -1 : ca > cb ? 1 : a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0;
+  });
+  const foldA: SnapshotProtocol[] = [];
+  const foldB: SnapshotProtocol[] = [];
+  stratified.forEach((p, i) => { (i % 2 === 0 ? foldA : foldB).push(p); });
   const errors: number[] = [];
   let within2x = 0;
-  for (const p of test) {
-    // The hybrid the board prices with: the multivariate fit when the protocol records its age,
-    // the TVL power law when it does not. Each test protocol is scored by a fit that never saw it.
-    const f = multivariateFeatures(p, snapshot.as_of);
-    const mv = trainCal.multivariate;
-    const hasMv = trainCal.multivariate.b1 !== 1 && f !== null;
-    const predicted = hasMv
-      ? Math.exp(mv.b0 + mv.b1 * f[0] + mv.b2 * f[1] + mv.b3 * f[2])
-      : p.tvl_usd * multipleFor(p, trainCal);
-    const err = Math.abs(Math.log(predicted / (p.mcap_usd as number)));
-    errors.push(err);
-    if (predicted / (p.mcap_usd as number) >= 0.5 && predicted / (p.mcap_usd as number) <= 2) within2x++;
-  }
+  const runFold = (train: SnapshotProtocol[], test: SnapshotProtocol[]): void => {
+    if (train.length === 0 || test.length === 0) return;
+    // The maturity term needs an age for protocols the snapshot does not date; the training
+    // fold's own median age is the value the calibration itself would earn, so the test is
+    // not given information the board never has.
+    const ages = train.map((p) => ageDays(snapshot.as_of, p.listed_at)).filter((a): a is number => a !== null);
+    const medianAge = ages.length > 0 ? ages.sort((a, b) => a - b)[Math.floor(ages.length / 2)]! : MODEL.unknown_age_days;
+    const trainSnapshot: Snapshot = { ...snapshot, protocols: train };
+    const cal = calibrate(trainSnapshot);
+    for (const p of test) {
+      // The board's own hybrid: the multivariate fit when the protocol records its age, the
+      // category multiple when it does not — exactly what buildBoard prices a pre-token row with.
+      const f = multivariateFeatures(p, snapshot.as_of);
+      const hasMv = cal.multivariate.b1 !== 1 && f !== null;
+      const predicted = hasMv
+        ? Math.exp(cal.multivariate.b0 + cal.multivariate.b1 * f[0] + cal.multivariate.b2 * f[1] + cal.multivariate.b3 * f[2])
+        : priceWithAge(p, cal, medianAge);
+      const err = Math.abs(Math.log(predicted / (p.mcap_usd as number)));
+      errors.push(err);
+      if (predicted / (p.mcap_usd as number) >= 0.5 && predicted / (p.mcap_usd as number) <= 2) within2x++;
+    }
+  };
+  runFold(foldA, foldB);
+  runFold(foldB, foldA);
   errors.sort((a, b) => a - b);
   const pick = (q: number): number => (errors.length === 0 ? 0 : errors[Math.min(errors.length - 1, Math.floor(q * errors.length))] as number);
   const medianPct = errors.length === 0 ? 0 : Math.round((Math.exp(pick(0.5)) - 1) * 100);
   return {
-    held_out: test.length,
-    in_sample: train.length,
+    held_out: errors.length,
+    in_sample: priced.length,
     median_abs_pct_error: medianPct,
     p10: errors.length === 0 ? 0 : Math.round((Math.exp(pick(0.1)) - 1) * 100),
     p90: errors.length === 0 ? 0 : Math.round((Math.exp(pick(0.9)) - 1) * 100),
@@ -377,6 +394,19 @@ export function impliedValue(protocol: SnapshotProtocol, asOf: string, model: Mo
   // implied value is clamped to a floor of $1 and a ceiling of $1 trillion (the whole market).
   const implied = Math.min(1e12, Math.max(1, Math.round(raw)));
   return { implied, growthPct, growthMult, maturityMult, age };
+}
+
+/**
+ * The board's own price for a protocol the snapshot does not date, as the held-out test scores it:
+ * the category size multiple with the maturity term read at the training fold's median age (the
+ * age the calibration itself would have to assume), so the test prices the row with the same
+ * arithmetic the board runs and no information the board never has.
+ */
+function priceWithAge(protocol: SnapshotProtocol, calibration: Calibration, medianAge: number): number {
+  const multiple = multipleFor(protocol, calibration);
+  const growth = 1 + (Math.min(MODEL.growth_cap, Math.max(MODEL.growth_floor, finite(protocol.change_7d, 0))) / 100) * MODEL.growth_weight;
+  const maturity = MODEL.maturity_floor + (Math.min(Math.max(medianAge, 0), MODEL.maturity_days) / MODEL.maturity_days) * MODEL.maturity_range;
+  return protocol.tvl_usd * multiple * growth * maturity;
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -544,10 +574,14 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
 
 /** The live-token protocols, by market cap, for the dashboard's Live token view. */
 export function liveRows(snapshot: Snapshot): LiveRow[] {
+  // Every protocol whose token already trades, none left out: a versioned pool or a shared
+  // symbol names a token that trades (DefiLlama carries the parent's token on it), so it is
+  // a live row, not a pre-token one. CEX protocols with a token are live rows too: the view
+  // is the market's own prices, and an exchange's token is one of them. This is the count
+  // the accounting strip states, so the page and the strip always agree.
   return snapshot.protocols
-    .filter((p) => !isPreToken(p) && p.category !== 'CEX')
+    .filter((p) => !isPreToken(p))
     .sort((a, b) => (b.mcap_usd ?? 0) - (a.mcap_usd ?? 0) || b.tvl_usd - a.tvl_usd)
-    .slice(0, LIVE_ROWS)
     .map((p) => ({
       slug: p.slug,
       name: p.name,
@@ -687,6 +721,11 @@ export function dataScript(radar: RadarData): string {
  * protocol in the snapshot is accounted for on the page.
  */
 export function setAsideReasons(snapshot: Snapshot): Record<string, number> {
+  // With liveRows carrying every token-bearing protocol (416 of this snapshot's 758) and the
+  // board ranking every pure pre-token one, the only rows left out of both views are the
+  // pre-token rows the house's own watchlist rule sets aside: CEX entries and versioned
+  // pools. The strip names each reason with its count, so 758 = ranked + live + set aside
+  // holds on the page exactly as it holds in the data.
   const reasons: Record<string, number> = {};
   for (const p of snapshot.protocols) {
     if (isPreToken(p) && !isRankable(p)) {

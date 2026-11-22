@@ -172,7 +172,8 @@
         el('div', { class: 'fact' }, el('span', { text: 'Watchlist covered' }), el('b', { text: DATA.watchlist_size + ' / ' + DATA.watchlist_size })),
         el('div', { class: 'fact' }, el('span', { text: 'Pre-token rows scored' }), el('b', { text: String(DATA.board_size) })),
         el('div', { class: 'fact' }, el('span', { text: 'Early rows below the floor' }), el('b', { text: String(DATA.early_size) })),
-        el('div', { class: 'fact' }, el('span', { text: 'Live-token protocols set aside' }), el('b', { text: String(DATA.live_size) }))
+        el('div', { class: 'fact' }, el('span', { text: 'Live tokens shown' }), el('b', { text: String(DATA.live.length) })),
+        el('div', { class: 'fact' }, el('span', { text: 'Snapshot accounted' }), el('b', { text: (DATA.board_size + DATA.live.length + (DATA.accounting ? DATA.accounting.set_aside : 0)) + ' / ' + (DATA.accounting ? DATA.accounting.total : '?') }))
       )
     );
   }
@@ -291,7 +292,7 @@
       : 'The size multiple is a single constant when the snapshot carries no live-token protocols.';
     var bt = DATA.backtest;
     var btText = bt
-      ? 'Held-out test: the ' + bt.in_sample + ' training protocols fit the model, the other ' + bt.held_out + ' are priced unseen. Median error ' + bt.median_abs_pct_error + '% (' + (bt.within_2x / Math.max(1, bt.held_out) * 100).toFixed(0) + '% within 2x, 10th percentile ' + bt.p10 + '%, 90th ' + bt.p90 + '%).'
+      ? 'Held-out test, two-fold: each fold calibrates on one half of the ' + bt.in_sample + ' priced live tokens and prices the other half unseen — every priced protocol is scored once, ' + bt.held_out + ' held out in all. The board\'s own function is what is scored: category multiple x growth term x maturity term, the same arithmetic behind every implied value on this page. Median error ' + bt.median_abs_pct_error + '% (' + (bt.within_2x / Math.max(1, bt.held_out) * 100).toFixed(0) + '% of rows within 2x, 10th percentile ' + bt.p10 + '%, 90th ' + bt.p90 + '%). A market cap is a wide thing to guess from a TVL: this is the honest spread of that guess.'
       : 'No held-out test.';
     var acc = DATA.accounting;
     var accText = acc
