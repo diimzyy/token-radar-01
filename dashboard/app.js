@@ -7,7 +7,7 @@
   var DATA = window.RADAR;
   if (!DATA) return;
   var app = document.getElementById('board');
-  var state = { q: '', category: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
+  var state = { q: '', category: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null, verdict: 'all' };
 
   var usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
   function fmtUsd(n) {
@@ -67,6 +67,15 @@
     if (p.tvl_usd >= 1e9) return 150;
     if (p.tvl_usd >= 1e8) return 100;
     return 50;
+  }
+  // The plan's whole cost, the same arithmetic the verdict's thresholds read: capital plus
+  // setup gas plus $2 of gas for each week of the hold. The page shows it so a reader can
+  // weigh the expected value against it without opening the plan.
+  function farmCostLabel(row) {
+    var hold = holdDaysFor(row.age_days);
+    var capital = capitalFor(row);
+    var gas = 2 * Math.ceil(hold / 7) + (capital >= 150 ? 8 : 4);
+    return '$' + (capital + gas);
   }
   function holdDaysFor(age) {
     if (age === null || age === undefined) return 30;
@@ -131,6 +140,7 @@
     var q = state.q.trim().toLowerCase();
     return DATA.rows.filter(function (r) {
       if (state.category !== 'all' && r.category !== state.category) return false;
+      if (state.verdict !== 'all' && r.farm_verdict !== state.verdict) return false;
       if (!q) return true;
       var hay = [r.name, r.slug, r.category, (r.chains || []).join(' ')].join(' ').toLowerCase();
       return hay.indexOf(q) >= 0;
@@ -144,6 +154,8 @@
       else if (key === 'tvl') { av = a.tvl_usd; bv = b.tvl_usd; }
       else if (key === 'growth') { av = a.change_7d === null ? -Infinity : a.change_7d; bv = b.change_7d === null ? -Infinity : b.change_7d; }
       else if (key === 'age') { av = a.age_days === null ? Infinity : a.age_days; bv = b.age_days === null ? Infinity : b.age_days; }
+      else if (key === 'odds') { av = a.token_odds; bv = b.token_odds; }
+      else if (key === 'ev') { av = a.expected_value_usd; bv = b.expected_value_usd; }
       else { av = a.implied_value_usd; bv = b.implied_value_usd; }
       if (av < bv) return -state.dir;
       if (av > bv) return state.dir;
@@ -189,9 +201,17 @@
     select.addEventListener('change', function () { state.category = select.value; writeHash(); render(); });
     var pre = el('button', { type: 'button', 'aria-pressed': state.tab === 'pre-token' ? 'true' : 'false', text: 'Pre-token', onclick: function () { state.tab = 'pre-token'; render(); } });
     var live = el('button', { type: 'button', 'aria-pressed': state.tab === 'live' ? 'true' : 'false', text: 'Live token', onclick: function () { state.tab = 'live'; render(); } });
+    var verdictSelect = el('select', { id: 'verdict', 'aria-label': 'Filter by farm verdict' },
+      el('option', { value: 'all', text: 'All verdicts' }),
+      el('option', { value: 'farm', text: 'farm only', selected: state.verdict === 'farm' ? 'selected' : null }),
+      el('option', { value: 'thin', text: 'thin only', selected: state.verdict === 'thin' ? 'selected' : null }),
+      el('option', { value: 'skip', text: 'skip only', selected: state.verdict === 'skip' ? 'selected' : null })
+    );
+    verdictSelect.addEventListener('change', function () { state.verdict = verdictSelect.value; writeHash(); render(); });
     return el('div', { class: 'controls' },
       el('div', { class: 'field' }, el('label', { for: 'q', text: 'Search' }), search),
       el('div', { class: 'field' }, el('label', { for: 'category', text: 'Category' }), select),
+      el('div', { class: 'field' }, el('label', { for: 'verdict', text: 'Verdict' }), verdictSelect),
       el('div', { class: 'field' }, el('span', { class: 'sub', text: 'Token status' }), el('div', { class: 'tabs' }, pre, live)),
       el('span', { class: 'count', text: state.tab === 'pre-token' ? rows().length + ' rows shown' : DATA.live.length + ' live-token protocols' })
     );
@@ -255,7 +275,7 @@
             sortHeader('growth', '7d'),
             sortHeader('age', 'Age'),
             sortHeader('implied', 'Implied value'),
-            el('th', { scope: 'col', text: 'Odds' }),
+            sortHeader('odds', 'Odds'),
             el('th', { scope: 'col', text: 'Verdict' }),
             el('th', { scope: 'col', text: 'Token' })
           )),
@@ -344,6 +364,16 @@
         el('div', null, el('span', { text: 'Implied value' }), el('b', { class: 'num', text: fmtUsd(row.implied_value_usd) }))
       ),
       el('p', { class: 'sub', text: 'Model ' + DATA.model_version + ': the same function scores every protocol. The page recomputes this row as ' + fmtUsd(impliedOf(row, DATA.model)) + (impliedOf(row, DATA.model) === row.implied_value_usd ? ', the same number board.json carries.' : ', which differs from the board: the data would be stale.') + ' This is an estimate, not a price.' })
+    ));
+    dialog.appendChild(el('section', { class: 'detail-section' },
+      el('h3', { text: 'Launch odds and farm verdict' }),
+      el('div', { class: 'equation' },
+        el('div', null, el('span', { text: 'Token odds (from peers)' }), el('b', { class: 'num', text: (row.token_odds * 100).toFixed(1) + '%' })),
+        el('div', null, el('span', { text: 'Expected value (implied x odds)' }), el('b', { class: 'num', text: fmtUsd(row.expected_value_usd) })),
+        el('div', null, el('span', { text: 'Plan capital + gas' }), el('b', { class: 'num', text: farmCostLabel(row) })),
+        el('div', null, el('span', { text: 'Verdict' }), el('b', { class: 'num', text: row.farm_verdict.toUpperCase() }))
+      ),
+      el('p', { class: 'sub', text: 'The odds read the snapshot\'s own record: the share of protocols in this category and TVL band that ever recorded a token, shrunk toward the overall share by peer count. The verdict is net of cost: the expected value must clear the plan\'s capital and weekly gas tenfold to farm, threefold to run thin, else skip. The thresholds are stated, so disagree with them and recompute.' })
     ));
     dialog.appendChild(el('section', { class: 'detail-section' },
       el('h3', { text: 'Farm plan' }),
