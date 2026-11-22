@@ -137,3 +137,11 @@ tbody tr[data-selected="true"] { background: color-mix(in srgb, var(--accent) 8%
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
 }
+/* The verdict column: three states, one accent each, so the board reads at a glance. */
+.status.verdict { font-weight: 600; }
+.status.verdict.farm::before { background: #1a7f37; }
+.status.verdict.thin::before { background: #b58105; }
+.status.verdict.skip::before { background: #a12622; }
+.status.verdict.farm { color: #1a7f37; }
+.status.verdict.thin { color: #8a6100; }
+.status.verdict.skip { color: #6e2222; }

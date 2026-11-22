@@ -127,7 +127,7 @@ function multivariateFeatures(p: SnapshotProtocol, asOf: string): [number, numbe
 }
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-5';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 2000;
@@ -158,6 +158,8 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  token_odds: number;
+  farm_verdict: 'farm' | 'thin' | 'skip';
   model: {
     base_multiple: number;
     growth_pct: number;
@@ -183,6 +185,9 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
+  token_odds: number;
+  farm_verdict: 'farm' | 'thin' | 'skip';
+  expected_value_usd: number;
   growth_multiplier: number;
   maturity_multiplier: number;
   multiple: number;
@@ -427,6 +432,88 @@ function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
 }
 
+/**
+ * The odds a pre-token protocol ever records a token, from the snapshot's own record: the share
+ * of the snapshot's protocols that already carry one, adjusted per category and per TVL decile,
+ * each shrunk toward the overall share by its own peer count (the same PRIOR_WEIGHT shrinkage the
+ * size multiples use), then averaged half and half. No name is special-cased: a category whose
+ * protocols mostly launched tokens earns a higher odds, and so does a TVL band.
+ */
+export function tokenOdds(snapshot: Snapshot): (p: SnapshotProtocol) => number {
+  const total = snapshot.protocols.length;
+  const withToken = snapshot.protocols.filter((p) => !isPreToken(p)).length;
+  const overall = total > 0 ? withToken / total : 0;
+  const byCat = new Map<string, { n: number; tok: number }>();
+  for (const p of snapshot.protocols) {
+    const key = p.category ?? '~';
+    const e = byCat.get(key) ?? { n: 0, tok: 0 };
+    e.n++;
+    if (!isPreToken(p)) e.tok++;
+    byCat.set(key, e);
+  }
+  const tvls = [...snapshot.protocols].map((p) => p.tvl_usd).sort((a, b) => a - b);
+  const decileCut = (d: number): number => tvls[Math.min(tvls.length - 1, Math.floor((d * tvls.length) / 10))] ?? 0;
+  const cuts = Array.from({ length: 9 }, (_, i) => decileCut(i + 1));
+  const decileOf = (tvl: number): number => {
+    let d = 0;
+    while (d < 9 && tvl >= (cuts[d] as number)) d++;
+    return d;
+  };
+  const byDec = new Map<number, { n: number; tok: number }>();
+  for (const p of snapshot.protocols) {
+    const key = decileOf(p.tvl_usd);
+    const e = byDec.get(key) ?? { n: 0, tok: 0 };
+    e.n++;
+    if (!isPreToken(p)) e.tok++;
+    byDec.set(key, e);
+  }
+  return (p: SnapshotProtocol): number => {
+    const cat = byCat.get(p.category ?? '~') ?? { n: 0, tok: 0 };
+    const catOdds = (cat.tok + PRIOR_WEIGHT * overall) / (cat.n + PRIOR_WEIGHT);
+    const dec = byDec.get(decileOf(p.tvl_usd)) ?? { n: 0, tok: 0 };
+    const decOdds = (dec.tok + PRIOR_WEIGHT * overall) / (dec.n + PRIOR_WEIGHT);
+    const blend = 0.5 * catOdds + 0.5 * decOdds;
+    return Math.min(0.98, Math.max(0.02, blend));
+  };
+}
+
+/**
+ * The farm verdict a reader acts on: farm when the odds justify the capital and the TVL is large
+ * enough that a snapshot of activity is cheap to reach (at least the watchlist floor), thin when
+ * the odds or the size make the position marginal, skip when neither supports the gas. The verdict
+ * is a function of the row's own figures, the same evidence the board shows.
+ */
+/**
+ * The farm verdict a reader acts on, net of cost: the expected value the position farms for is the
+ * implied value times the odds the token ever comes, and the plan costs its capital plus weekly
+ * gas over its hold. Farm when the expected value clears that cost by ten times and the odds and
+ * the TVL both hold (the watchlist floor is where a snapshot of activity is cheap to reach); thin
+ * when it clears it three times; skip when it does not clear. The thresholds are stated so the
+ * reader can disagree with them, and the page recomputes every row's verdict from the same numbers
+ * the board shows.
+ */
+export function farmVerdict(p: SnapshotProtocol, odds: number, implied: number): 'farm' | 'thin' | 'skip' {
+  const hold = holdDaysFor(p.listed_at ? ageDaysFromListed(p.listed_at) : null);
+  const capital = capitalFor(p);
+  const cost = capital + 2 * Math.ceil(hold / 7) + (capital >= 150 ? 8 : 4);
+  const expected = implied * odds;
+  if (expected >= 10 * cost && p.tvl_usd >= snapshotFloor(p) && odds >= 0.3) return 'farm';
+  if (expected >= 3 * cost && odds >= 0.2) return 'thin';
+  return 'skip';
+}
+
+/** A protocol's age in days from its listed_at alone, at a fixed epoch the dashboard agrees with. */
+function ageDaysFromListed(listedAt: string): number {
+  const t = Date.parse(listedAt);
+  if (Number.isNaN(t)) return 365;
+  return Math.max(0, Math.round((Date.UTC(2026, 10, 14) - t) / 86_400_000));
+}
+
+/** The snapshot's own watchlist floor, as a TVL a farm position can lean on. */
+function snapshotFloor(p: SnapshotProtocol): number {
+  return 50_000_000;
+}
+
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const index = bySlug(snapshot.protocols);
@@ -453,6 +540,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     return { p, implied, growthPct, growthMult, maturityMult, age };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
+  const odds = tokenOdds(snapshot);
   return scored.map((s, i) => ({
     rank: i + 1,
     slug: s.p.slug,
@@ -468,6 +556,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     token_status: 'pre-token',
     age_days: s.age,
     implied_value_usd: s.implied,
+    token_odds: round4(odds(s.p)),
+    farm_verdict: farmVerdict(s.p, odds(s.p), s.implied),
     model: {
       base_multiple: multipleFor(s.p, calibration),
       growth_pct: s.growthPct,
@@ -607,6 +697,9 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    token_odds: row.token_odds,
+    farm_verdict: row.farm_verdict,
+    expected_value_usd: Math.round(row.implied_value_usd * row.token_odds),
     growth_multiplier: row.model.growth_multiplier,
     maturity_multiplier: row.model.maturity_multiplier,
     multiple: row.model.multiple,

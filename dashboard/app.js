@@ -238,6 +238,8 @@
           el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((r.implied_value_usd / max) * 100)) + '%' })),
           el('span', { class: 'num', text: fmtUsd(r.implied_value_usd) })
         )),
+        el('td', { class: 'num', text: (r.token_odds * 100).toFixed(0) + '%', title: 'The share of this snapshot\'s peers in the same category and TVL decile that ever recorded a token: the odds read from the peers\' record, never from the protocol\'s name.' }),
+        el('td', null, el('span', { class: 'status verdict ' + r.farm_verdict, text: r.farm_verdict, title: 'Net of cost: expected value (implied x odds) against the plan\'s capital and gas. farm = clears 10x, thin = clears 3x, skip = does not clear.' })),
         el('td', null, el('span', { class: 'status', text: 'no token' }))
       );
       tbody.appendChild(tr);
@@ -253,6 +255,8 @@
             sortHeader('growth', '7d'),
             sortHeader('age', 'Age'),
             sortHeader('implied', 'Implied value'),
+            el('th', { scope: 'col', text: 'Odds' }),
+            el('th', { scope: 'col', text: 'Verdict' }),
             el('th', { scope: 'col', text: 'Token' })
           )),
           tbody
