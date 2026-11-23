@@ -316,7 +316,7 @@
       : 'The size multiple is a single constant when the snapshot carries no live-token protocols.';
     var bt = DATA.backtest;
     var btText = bt
-      ? 'Held-out test, two-fold: each fold calibrates on one half of the ' + bt.in_sample + ' priced live tokens and prices the other half unseen — every priced protocol is scored once, ' + bt.held_out + ' held out in all. The board\'s own function is what is scored: category multiple x growth term x maturity term, the same arithmetic behind every implied value on this page. Median error ' + bt.median_abs_pct_error + '% (' + (bt.within_2x / Math.max(1, bt.held_out) * 100).toFixed(0) + '% of rows within 2x, 10th percentile ' + bt.p10 + '%, 90th ' + bt.p90 + '%). A market cap is a wide thing to guess from a TVL: this is the honest spread of that guess.'
+      ? 'Held-out test, two-fold: each fold calibrates on one half of the ' + bt.in_sample + ' priced live tokens and prices the other half unseen — every priced protocol is scored once, ' + bt.held_out + ' held out in all. The board\'s own function is what is scored: the per-category multivariate fit (log TVL, growth, age), priced on the other half unseen, the same fit behind every implied value on this page. Median error ' + bt.median_abs_pct_error + '% (' + (bt.within_2x / Math.max(1, bt.held_out) * 100).toFixed(0) + '% of rows within 2x, 10th percentile ' + bt.p10 + '%, 90th ' + bt.p90 + '%). A market cap is a wide thing to guess from a TVL: this is the honest spread of that guess.'
       : 'No held-out test.';
     var acc = DATA.accounting;
     var accText = acc
