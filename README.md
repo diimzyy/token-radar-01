@@ -10,6 +10,14 @@ every watchlist slug by a calibrated implied-value model (per-category
 mcap/TVL curves with shrinkage toward the category median), token-odds
 estimates, and costed farm plans, and serves an interactive dashboard.
 
+The board keeps the two populations apart: the **Pre-token** tab carries the
+289 protocols with no token on record (40 watchlist slugs plus 249 early names
+below the $10M floor), ranked by implied value; the **Live token** tab carries
+the 416 protocols whose token already trades, with their real market cap, so a
+reader can see what the model is calibrated against and what it is predicting.
+`out/dossier.json` embeds the same board plus four screenshots (board, row
+detail, live tab, verdict filter) at 2880x1600.
+
 ## Run it
 
 ```sh
