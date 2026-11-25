@@ -174,6 +174,25 @@
     );
   }
 
+  function money(n) {
+    if (!isFinite(n)) return '—';
+    if (n >= 1e9) return '$' + (n / 1e9).toFixed(2) + 'B';
+    if (n >= 1e6) return '$' + (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return '$' + (n / 1e3).toFixed(0) + 'K';
+    return '$' + Math.round(n);
+  }
+
+  function medianImplied() {
+    var vals = DATA.rows.map(function (r) { return r.implied_value_usd; }).filter(function (v) { return isFinite(v) && v > 0; }).sort(function (a, b) { return a - b; });
+    if (!vals.length) return '—';
+    var mid = Math.floor(vals.length / 2);
+    return money(vals.length % 2 ? vals[mid] : (vals[mid - 1] + vals[mid]) / 2);
+  }
+
+  function farmCount() {
+    return DATA.rows.filter(function (r) { return r.farm_verdict === 'farm'; }).length;
+  }
+
   function lede() {
     return el('section', { class: 'lede' },
       el('div', null,
@@ -185,6 +204,8 @@
         el('div', { class: 'fact' }, el('span', { text: 'Pre-token rows scored' }), el('b', { text: String(DATA.board_size) })),
         el('div', { class: 'fact' }, el('span', { text: 'Early rows below the floor' }), el('b', { text: String(DATA.early_size) })),
         el('div', { class: 'fact' }, el('span', { text: 'Live tokens shown' }), el('b', { text: String(DATA.live.length) })),
+        el('div', { class: 'fact' }, el('span', { text: 'Median implied value' }), el('b', { text: medianImplied() })),
+        el('div', { class: 'fact' }, el('span', { text: 'Farm-ready rows' }), el('b', { text: farmCount() + ' of ' + DATA.board_size })),
         el('div', { class: 'fact' }, el('span', { text: 'Snapshot accounted' }), el('b', { text: (DATA.board_size + DATA.live.length + (DATA.accounting ? DATA.accounting.set_aside : 0)) + ' / ' + (DATA.accounting ? DATA.accounting.total : '?') }))
       )
     );
@@ -199,8 +220,8 @@
       categories.map(function (c) { return el('option', { value: c, text: c, selected: c === state.category ? 'selected' : null }); })
     );
     select.addEventListener('change', function () { state.category = select.value; writeHash(); render(); });
-    var pre = el('button', { type: 'button', 'aria-pressed': state.tab === 'pre-token' ? 'true' : 'false', text: 'Pre-token', onclick: function () { state.tab = 'pre-token'; render(); } });
-    var live = el('button', { type: 'button', 'aria-pressed': state.tab === 'live' ? 'true' : 'false', text: 'Live token', onclick: function () { state.tab = 'live'; render(); } });
+    var pre = el('button', { type: 'button', 'aria-pressed': state.tab === 'pre-token' ? 'true' : 'false', text: 'Pre-token ' + DATA.board_size, onclick: function () { state.tab = 'pre-token'; render(); } });
+    var live = el('button', { type: 'button', 'aria-pressed': state.tab === 'live' ? 'true' : 'false', text: 'Live token ' + DATA.live.length, onclick: function () { state.tab = 'live'; render(); } });
     var verdictSelect = el('select', { id: 'verdict', 'aria-label': 'Filter by farm verdict' },
       el('option', { value: 'all', text: 'All verdicts' }),
       el('option', { value: 'farm', text: 'farm only', selected: state.verdict === 'farm' ? 'selected' : null }),
