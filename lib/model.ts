@@ -127,7 +127,7 @@ function multivariateFeatures(p: SnapshotProtocol, asOf: string): [number, numbe
 }
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-8';
+export const MODEL_VERSION = 'radar-9';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 2000;
