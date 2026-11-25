@@ -77,8 +77,6 @@ export interface Calibration {
   by_category: Record<string, { intercept: number; slope: number }>;
   /** The multivariate fit on (log TVL, 7-day growth, log age): log mcap = b0 + b1·log TVL + b2·growth + b3·log age. */
   multivariate: { b0: number; b1: number; b2: number; b3: number };
-  /** The same multivariate fit per category, shrunk toward the global fit by the category's priced-peer count. */
-  multivariate_by_category: Record<string, { b0: number; b1: number; b2: number; b3: number }>;
   /** How many live-token protocols the calibration read. */
   live_tokens: number;
   /** How many categories the calibration covers. */
@@ -129,7 +127,7 @@ function multivariateFeatures(p: SnapshotProtocol, asOf: string): [number, numbe
 }
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-7';
+export const MODEL_VERSION = 'radar-8';
 
 /** How many pre-token protocols below the watchlist floor the early radar carries, by TVL. */
 export const EARLY_ROWS = 2000;
@@ -164,7 +162,6 @@ export interface BoardRow {
   farm_verdict: 'farm' | 'thin' | 'skip';
   model: {
     base_multiple: number;
-    fit: string;
     growth_pct: number;
     growth_multiplier: number;
     maturity_multiplier: number;
@@ -260,13 +257,12 @@ export function backtest(snapshot: Snapshot): RadarData['backtest'] {
     const trainSnapshot: Snapshot = { ...snapshot, protocols: train };
     const cal = calibrate(trainSnapshot);
     for (const p of test) {
-      // The board's own hybrid: the per-category multivariate fit when the protocol records its
-      // age, the category multiple when it does not — exactly what buildBoard prices a pre-token row with.
+      // The board's own hybrid: the multivariate fit when the protocol records its age, the
+      // category multiple when it does not — exactly what buildBoard prices a pre-token row with.
       const f = multivariateFeatures(p, snapshot.as_of);
-      const catMv = cal.multivariate_by_category[p.category ?? 'Uncategorised'] ?? cal.multivariate;
-      const hasMv = catMv.b1 !== 1 && f !== null;
+      const hasMv = cal.multivariate.b1 !== 1 && f !== null;
       const predicted = hasMv
-        ? Math.exp(catMv.b0 + catMv.b1 * f[0] + catMv.b2 * f[1] + catMv.b3 * f[2])
+        ? Math.exp(cal.multivariate.b0 + cal.multivariate.b1 * f[0] + cal.multivariate.b2 * f[1] + cal.multivariate.b3 * f[2])
         : priceWithAge(p, cal, medianAge);
       const err = Math.abs(Math.log(predicted / (p.mcap_usd as number)));
       errors.push(err);
@@ -367,49 +363,7 @@ export function calibrate(snapshot: Snapshot): Calibration {
     const beta = solve(ATA, ATY);
     mv = { b0: round4(beta[0] as number), b1: round4(beta[1] as number), b2: round4(beta[2] as number), b3: round4(beta[3] as number) };
   }
-  // Per-category multivariate fits, shrunk toward the global fit by each category's priced-peer
-  // count (the same PRIOR_WEIGHT shrinkage the power laws use), so a two-peer category cannot
-  // dictate the board while a well-evidenced one keeps its own growth/age shape.
-  const mvByCat: Record<string, { b0: number; b1: number; b2: number; b3: number }> = {};
-  const catRows = new Map<string, [number[], number][]>();
-  for (const p of priced) {
-    const f = multivariateFeatures(p, snapshot.as_of);
-    if (f === null) continue;
-    const key = p.category ?? 'Uncategorised';
-    let arr = catRows.get(key);
-    if (arr === undefined) { arr = []; catRows.set(key, arr); }
-    arr.push([[f[0], f[1], f[2]], Math.log(p.mcap_usd as number)]);
-  }
-  for (const [key, crows] of catRows) {
-    if (crows.length >= 5) {
-      const k = 4;
-      const X = crows.map(([f]) => [1, f[0], f[1], f[2]]);
-      const Y = crows.map(([, y]) => y);
-      const ATA: number[][] = [];
-      const ATY: number[] = [];
-      for (let a = 0; a < k; a++) {
-        const row: number[] = [];
-        for (let b = 0; b < k; b++) row.push(X.reduce((s, r, i) => s + r[a]! * r[b]!, 0));
-        ATA.push(row);
-        ATY.push(X.reduce((s, r, i) => s + r[a]! * Y[i]!, 0));
-      }
-      const beta = solve(ATA, ATY);
-      const own = [beta[0], beta[1], beta[2], beta[3]] as number[];
-      const global = [mv.b0, mv.b1, mv.b2, mv.b3];
-      // Stronger shrinkage for tiny samples: a 5-peer category blends only a third of its own
-      // view into the board; the prior does the rest, so one outlier cannot swing the category.
-      const w = Math.min(0.5, crows.length / (crows.length + PRIOR_WEIGHT * 2));
-      mvByCat[key] = {
-        b0: round4(w * (own[0] as number) + (1 - w) * global[0]),
-        b1: round4(w * (own[1] as number) + (1 - w) * global[1]),
-        b2: round4(w * (own[2] as number) + (1 - w) * global[2]),
-        b3: round4(w * (own[3] as number) + (1 - w) * global[3]),
-      };
-    } else {
-      mvByCat[key] = mv;
-    }
-  }
-  return { overall: { intercept: round4(overall.intercept), slope: round4(overall.slope) }, overall_multiple: round4(overallMultiple), by_category: out, multivariate: mv, multivariate_by_category: mvByCat, live_tokens: priced.length, categories: byCat.size };
+  return { overall: { intercept: round4(overall.intercept), slope: round4(overall.slope) }, overall_multiple: round4(overallMultiple), by_category: out, multivariate: mv, live_tokens: priced.length, categories: byCat.size };
 }
 
 /**
@@ -581,32 +535,11 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
   for (const p of early) chosen.set(p.slug, p);
 
   const scored = [...chosen.values()].map((p) => {
-    const multiple = multipleFor(p, calibration);
-    // The multivariate fit is the price when the protocol records its age; per-category when the
-    // calibration carries one, the global fit otherwise. The category multiple prices it otherwise.
-    const f = multivariateFeatures(p, snapshot.as_of);
-    const catMv = calibration.multivariate_by_category[p.category ?? 'Uncategorised'] ?? calibration.multivariate;
-    let implied: number;
-    let growthPct: number;
-    let growthMult: number;
-    let maturityMult: number;
-    let age: number | null;
-    if (f !== null && catMv.b1 !== 1) {
-      const mvImplied = Math.exp(catMv.b0 + catMv.b1 * f[0] + catMv.b2 * f[1] + catMv.b3 * f[2]);
-      implied = Math.min(1e12, Math.max(1, Math.round(mvImplied)));
-      growthPct = finite(p.change_7d, 0);
-      const g = 1 + (Math.min(MODEL.growth_cap, Math.max(MODEL.growth_floor, growthPct)) / 100) * MODEL.growth_weight;
-      growthMult = g;
-      maturityMult = 1;
-      age = ageDays(snapshot.as_of, p.listed_at);
-    } else {
-      const v = impliedValue(p, snapshot.as_of, model, multiple);
-      implied = v.implied;
-      growthPct = v.growthPct;
-      growthMult = v.growthMult;
-      maturityMult = v.maturityMult;
-      age = v.age;
-    }
+    // The page recomputes a row from the same figures board.json carries, so the multiple it prices
+    // with is the rounded one the row publishes: the two arithmetics then agree to the dollar
+    // instead of differing in the last digits.
+    const multiple = round4(multipleFor(p, calibration));
+    const { implied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, model, multiple);
     return { p, implied, growthPct, growthMult, maturityMult, age };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -630,7 +563,6 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     farm_verdict: farmVerdict(s.p, odds(s.p), s.implied),
     model: {
       base_multiple: multipleFor(s.p, calibration),
-      fit: 'multivariate-by-category',
       growth_pct: s.growthPct,
       growth_multiplier: round4(s.growthMult),
       maturity_multiplier: round4(s.maturityMult),
